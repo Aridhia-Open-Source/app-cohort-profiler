@@ -16,14 +16,19 @@
 required_packages <- c("shiny", "shinydashboard", "DT", "ggplot2",
                        "dplyr", "tidyr", "scales", "readr", "tools")
 
+# Install any missing package from the workspace-allowlisted CRAN mirror, then load.
+# requireNamespace() avoids reinstalling packages that are already present.
 for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    message(sprintf("[ cohort profiler ] installing missing package: %s", pkg))
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
   if (!requireNamespace(pkg, quietly = TRUE))
-    stop(paste0("Required package '", pkg, "' is not installed."), call. = FALSE)
+    stop(paste0("Required package '", pkg,
+                "' is not installed and could not be installed automatically."),
+         call. = FALSE)
+  library(pkg, character.only = TRUE)
 }
-
-library(shiny); library(shinydashboard); library(DT)
-library(ggplot2); library(dplyr); library(tidyr)
-library(scales);  library(readr);  library(tools)
 
 message("[ cohort profiler ] libraries loaded.")
 
