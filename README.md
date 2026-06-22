@@ -9,6 +9,9 @@ user-defined range validation — without any data leaving the secure workspace 
 The entire application is a single self-contained `app.R` file. There are no external
 service calls; all analysis runs locally against files already on the workspace disk.
 
+Wathc a video of how to use cohort profiler here:
+https://scribehow.com/embed-preview/Analyze_Synthetic_Alzheimers_Data_in_Aridhia_Workspaces__Bx7yuLm8Rfmfpg3XnOPDuQ?as=video&size=flexible&voice=shimmer&scaleMode=contain
+
 ---
 
 ## Contents
