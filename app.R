@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════════════════════
-#  Aridhia DRE - Cohort Profiler  (v4.1)
+#  Aridhia DRE - Cohort Profiler  (v4.2)
 #  Single-file app.R for deployment to a DRE Project Workspace
 #
 #  v1   - Core profiling: missingness, outliers, correlations, distributions
@@ -8,6 +8,11 @@
 #  v4   - Cohort Comparison tab (overlay two datasets), Range Validation tab (user-defined rules)
 #  v4.1 - Exports now SAVE directly into the workspace via a folder picker
 #         (default /home/workspace/files/) instead of browser downloads
+#  v4.2 - Relational (multi-table) profiling: load a folder of linked CSVs,
+#         detect the common identifier, map relationships (ER diagram), and run
+#         linkage-integrity diagnostics (key uniqueness, orphans, subject
+#         coverage, cardinality, key format drift). Any loaded table can be made
+#         active to drive the existing single-file tabs.
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -759,6 +764,354 @@ plot_dl_btn <- function(id, label = "Save PNG") {
 }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  RELATIONAL (MULTI-TABLE) PROFILING - PHASE 1
+#  Whole-folder CSV load, candidate-key detection, relationship mapping, and
+#  linkage-integrity diagnostics for datasets split across several linked CSVs.
+#  These operate on a NAMED LIST of data frames; the single-file profiling engine
+#  above is reused unchanged on whichever table the user makes "active".
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── FOLDER PICKER MODAL ───────────────────────────────────────────────────────
+# Like open_file_modal, but selects a *directory* of CSVs rather than one file.
+# Shows the CSV count beside each folder and a "Load all CSVs here" confirm button.
+open_folder_modal <- function(dir) {
+  if (!dir.exists(dir)) {
+    showNotification(paste("Directory not found:", dir), type = "error"); return()
+  }
+  items      <- list.files(dir, full.names = FALSE, all.files = FALSE)
+  full_paths <- file.path(dir, items)
+  is_dir     <- dir.exists(full_paths)
+  dirs       <- sort(items[is_dir])
+  n_csv_here <- length(list.files(dir, pattern = FILE_PATTERN, ignore.case = TRUE))
+
+  root     <- WORKSPACE_FILES
+  rel_path <- sub(paste0("^", gsub("([.+*?|(){}\\[\\]^$\\\\])", "\\\\\\1", root)), "", dir)
+  parts    <- Filter(nzchar, strsplit(rel_path, "/")[[1]])
+
+  crumbs <- tagList(
+    tags$a(href = "#", class = "fb-crumb-link",
+           onclick = sprintf("Shiny.setInputValue('folder_nav_to','%s',{priority:'event'}); return false;", root),
+           "files"),
+    tags$span(class = "fb-crumb-sep", " / ")
+  )
+  for (i in seq_along(parts)) {
+    p <- file.path(root, paste(parts[seq_len(i)], collapse = "/"))
+    crumbs <- tagList(crumbs,
+      tags$a(href = "#", class = "fb-crumb-link",
+             onclick = sprintf("Shiny.setInputValue('folder_nav_to','%s',{priority:'event'}); return false;", p),
+             parts[i]),
+      tags$span(class = "fb-crumb-sep", " / "))
+  }
+
+  body_content <- tagList(
+    div(class = "fb-modal-breadcrumb", crumbs),
+    div(class = "fb-save-current",
+        div(class = "fb-save-current-path", icon("folder-open"), " ", dir)),
+    div(style = "margin:2px 0 10px; font-size:0.86rem; color:#4A6070;",
+        if (n_csv_here > 0)
+          tagList(icon("file-csv"),
+                  sprintf(" %d CSV file%s directly in this folder",
+                          n_csv_here, if (n_csv_here != 1) "s" else ""))
+        else "No CSV files directly in this folder \u2014 open a subfolder below."),
+    if (dir != root)
+      div(class = "fb-modal-row fb-modal-dir",
+          onclick = sprintf("Shiny.setInputValue('folder_nav_to','%s',{priority:'event'})", dirname(dir)),
+          icon("arrow-up"), tags$span(" ..")),
+    lapply(dirs, function(d) {
+      sub_n <- length(list.files(file.path(dir, d), pattern = FILE_PATTERN, ignore.case = TRUE))
+      div(class = "fb-modal-row fb-modal-dir",
+          onclick = sprintf("Shiny.setInputValue('folder_nav_to','%s',{priority:'event'})", file.path(dir, d)),
+          icon("folder"), tags$span(class = "fb-modal-name", d),
+          tags$span(class = "fb-modal-size", if (sub_n > 0) sprintf("%d CSV", sub_n) else ""))
+    }),
+    if (length(dirs) == 0)
+      p(class = "fb-modal-empty",
+        "No subfolders here. Use the button below to load the CSVs in this folder.")
+  )
+
+  showModal(modalDialog(
+    title = tagList(icon("folder-tree"), " Load a folder of CSV files"),
+    body_content, size = "l", easyClose = TRUE,
+    footer = tagList(
+      modalButton("Cancel"),
+      actionButton("load_folder_confirm",
+                   label = tagList(icon("layer-group"),
+                                   sprintf(" Load %d CSV file%s here", n_csv_here,
+                                           if (n_csv_here != 1) "s" else "")),
+                   class = "btn-save-confirm")
+    )
+  ))
+}
+
+# ── KEY DETECTION ─────────────────────────────────────────────────────────────
+# Per-column key diagnostics for one table. A primary-key candidate is a column
+# whose non-missing values are all unique and which has no missing values.
+detect_candidate_keys <- function(df) {
+  n <- nrow(df)
+  do.call(rbind, lapply(names(df), function(cn) {
+    x     <- df[[cn]]
+    n_na  <- sum(is.na(x))
+    nu    <- length(unique(x[!is.na(x)]))
+    ratio <- if (n > 0) nu / n else 0
+    data.frame(column = cn, type = col_type_label(x), n_unique = nu, n_missing = n_na,
+               uniq_ratio = round(ratio, 4), is_key = (n_na == 0 && nu == n && n > 0),
+               stringsAsFactors = FALSE)
+  }))
+}
+
+# Best single-column primary key: a unique+complete column, preferring id-like names.
+best_primary_key <- function(df) {
+  ck   <- detect_candidate_keys(df)
+  keys <- ck$column[ck$is_key]
+  if (length(keys) == 0) return(NA_character_)
+  id_like <- keys[grepl("id", tolower(keys))]
+  if (length(id_like) > 0) return(id_like[1])
+  keys[1]
+}
+
+# Normalise a column name for cross-table matching (case/punctuation-insensitive).
+.norm_name <- function(s) gsub("[^a-z0-9]", "", tolower(trimws(s)))
+
+# Find the actual column name in a table matching a normalised key, else NA.
+resolve_col <- function(df, norm_name) {
+  hit <- names(df)[vapply(names(df), function(cn) .norm_name(cn) == norm_name, logical(1))]
+  if (length(hit) > 0) hit[1] else NA_character_
+}
+
+# Columns shared (by normalised name) across >= 2 tables - the candidate links.
+detect_shared_columns <- function(tables) {
+  reg <- list(); disp <- list()
+  for (tn in names(tables)) {
+    seen <- character(0)
+    for (cn in names(tables[[tn]])) {
+      k <- .norm_name(cn)
+      if (!nzchar(k) || k %in% seen) next
+      seen <- c(seen, k)
+      reg[[k]] <- c(reg[[k]], tn)
+      if (is.null(disp[[k]])) disp[[k]] <- cn
+    }
+  }
+  shared <- Filter(function(v) length(v) >= 2, reg)
+  if (length(shared) == 0) return(NULL)
+  out <- do.call(rbind, lapply(names(shared), function(k)
+    data.frame(norm_name = k, column = disp[[k]], n_tables = length(shared[[k]]),
+               tables = paste(shared[[k]], collapse = ", "), stringsAsFactors = FALSE)))
+  out[order(-out$n_tables, out$column), , drop = FALSE]
+}
+
+# Given a chosen link column (normalised), split holders into spine + children.
+# Spine = the table where the link is a unique, complete key (most distinct IDs).
+classify_link <- function(tables, link_norm) {
+  holders <- character(0); info <- list()
+  for (tn in names(tables)) {
+    col <- resolve_col(tables[[tn]], link_norm)
+    if (is.na(col)) next
+    x    <- tables[[tn]][[col]]
+    n    <- length(x); n_na <- sum(is.na(x)); nu <- length(unique(x[!is.na(x)]))
+    info[[tn]] <- list(col = col, n = n, n_na = n_na, n_unique = nu, type = col_type_label(x),
+                       is_unique = (n_na == 0 && nu == n && n > 0))
+    holders <- c(holders, tn)
+  }
+  if (length(holders) == 0) return(NULL)
+  uniq_holders <- holders[vapply(holders, function(h) info[[h]]$is_unique, logical(1))]
+  spine <- if (length(uniq_holders) > 0)
+             uniq_holders[which.max(vapply(uniq_holders, function(h) info[[h]]$n_unique, numeric(1)))]
+           else
+             holders[which.max(vapply(holders, function(h) info[[h]]$n_unique, numeric(1)))]
+  list(holders = holders, info = info, spine = spine,
+       children = setdiff(holders, spine), spine_is_clean = info[[spine]]$is_unique)
+}
+
+# ── LINKAGE DIAGNOSTICS ───────────────────────────────────────────────────────
+spine_ids <- function(tables, cls) {
+  x <- tables[[cls$spine]][[cls$info[[cls$spine]]$col]]
+  unique(x[!is.na(x)])
+}
+
+# Orphans, subject coverage, and cardinality for each child against the spine.
+linkage_child_report <- function(tables, cls) {
+  ref <- spine_ids(tables, cls)
+  do.call(rbind, lapply(cls$children, function(ch) {
+    col      <- cls$info[[ch]]$col
+    x        <- tables[[ch]][[col]]
+    present  <- x[!is.na(x)]
+    n_orphan <- sum(!(present %in% ref))
+    matched  <- present[present %in% ref]
+    n_cov    <- length(unique(matched))
+    card     <- as.integer(table(matched))
+    data.frame(
+      child            = ch,
+      link_col         = col,
+      n_rows           = length(x),
+      n_missing_key    = sum(is.na(x)),
+      n_orphan         = n_orphan,
+      pct_orphan       = if (length(present) > 0) round(100 * n_orphan / length(present), 1) else 0,
+      subjects_covered = n_cov,
+      pct_coverage     = if (length(ref) > 0) round(100 * n_cov / length(ref), 1) else 0,
+      n_childless      = length(ref) - n_cov,
+      card_min         = if (length(card) > 0) min(card) else 0L,
+      card_median      = if (length(card) > 0) as.numeric(stats::median(card)) else 0,
+      card_max         = if (length(card) > 0) max(card) else 0L,
+      relationship     = if (length(card) > 0 && max(card) == 1) "1:1" else "1:many",
+      stringsAsFactors = FALSE)
+  }))
+}
+
+# A small sample of orphan IDs for one child (disclosure is admin-governed here).
+orphan_sample <- function(tables, cls, child, k = 8) {
+  ref     <- spine_ids(tables, cls)
+  x       <- tables[[child]][[cls$info[[child]]$col]]
+  present <- x[!is.na(x)]
+  orph    <- unique(present[!(present %in% ref)])
+  if (length(orph) == 0) return("")
+  paste(utils::head(orph, k), collapse = ", ")
+}
+
+# Cardinality vector (rows per spine subject) for one child, for plotting.
+cardinality_vector <- function(tables, cls, child) {
+  ref     <- spine_ids(tables, cls)
+  x       <- tables[[child]][[cls$info[[child]]$col]]
+  present <- x[!is.na(x)]
+  as.integer(table(present[present %in% ref]))
+}
+
+# Type + format of the link column across all tables that hold it (drift check).
+linkage_format_drift <- function(tables, cls) {
+  do.call(rbind, lapply(cls$holders, function(tn) {
+    col    <- cls$info[[tn]]$col
+    x      <- tables[[tn]][[col]]
+    chr    <- as.character(x[!is.na(x)])
+    ws     <- any(chr != trimws(chr))
+    lead0  <- any(grepl("^0[0-9]", chr))
+    widths <- if (length(chr) > 0) range(nchar(chr)) else c(NA, NA)
+    samp   <- if (length(chr) > 0) paste(utils::head(unique(chr), 3), collapse = ", ") else ""
+    data.frame(
+      table         = tn,
+      column        = col,
+      r_type        = class(x)[1],
+      width         = if (any(is.na(widths))) "" else if (widths[1] == widths[2]) as.character(widths[1])
+                      else paste0(widths[1], "-", widths[2]),
+      whitespace    = if (ws) "yes" else "no",
+      leading_zeros = if (lead0) "yes" else "no",
+      sample        = samp,
+      stringsAsFactors = FALSE)
+  }))
+}
+
+# ── RELATIONAL PLOTS ──────────────────────────────────────────────────────────
+# Entity-relationship diagram drawn in ggplot2 (no extra dependencies, and it
+# exports through the same save-PNG path as every other chart).
+plot_er_diagram <- function(tables, cls, child_rep = NULL) {
+  spine    <- cls$spine
+  children <- cls$children
+  isolated <- setdiff(names(tables), cls$holders)
+  node_w <- 2.8; node_h <- 1.05
+
+  mk_node <- function(name, x, y, role) {
+    df  <- tables[[name]]
+    key <- if (!is.na(cls$info[[name]]$col)) cls$info[[name]]$col else best_primary_key(df)
+    data.frame(name = name, x = x, y = y, role = role, rows = nrow(df),
+               key = key %||% "\u2014", stringsAsFactors = FALSE)
+  }
+
+  nodes <- mk_node(spine, 0, 0, "spine")
+  nc <- length(children)
+  if (nc > 0) {
+    ys <- if (nc == 1) 0 else seq((nc - 1), -(nc - 1), length.out = nc) * 1.5
+    for (i in seq_along(children)) nodes <- rbind(nodes, mk_node(children[i], 7, ys[i], "child"))
+  }
+  ni <- length(isolated)
+  if (ni > 0) {
+    base_y <- min(nodes$y) - 2.6
+    xs <- if (ni == 1) 3.5 else seq(0, 7, length.out = ni)
+    for (i in seq_along(isolated)) nodes <- rbind(nodes, mk_node(isolated[i], xs[i], base_y, "isolated"))
+  }
+
+  edges <- NULL
+  if (nc > 0) {
+    edges <- do.call(rbind, lapply(children, function(ch) {
+      rel <- if (!is.null(child_rep)) child_rep$relationship[child_rep$child == ch][1] else "1:many"
+      data.frame(x = node_w / 2, xend = 7 - node_w / 2, y = 0,
+                 yend = nodes$y[nodes$name == ch], label = rel %||% "1:many",
+                 stringsAsFactors = FALSE)
+    }))
+  }
+
+  fill_for <- c(spine = "#007A6E", child = "#5A8FA8", isolated = "#B0413E")
+  g <- ggplot2::ggplot()
+  if (!is.null(edges))
+    g <- g +
+      ggplot2::geom_segment(data = edges, ggplot2::aes(x = x, y = y, xend = xend, yend = yend),
+                            colour = "#4A6070", linewidth = 0.7,
+                            arrow = ggplot2::arrow(length = ggplot2::unit(0.18, "cm"), type = "closed")) +
+      ggplot2::geom_label(data = edges, ggplot2::aes(x = (x + xend) / 2, y = (y + yend) / 2, label = label),
+                          fill = "#FFFFFF", colour = "#1A2A3A", size = 3.1, label.size = 0)
+  g +
+    ggplot2::geom_tile(data = nodes, ggplot2::aes(x = x, y = y, fill = role),
+                       width = node_w, height = node_h, colour = "#FFFFFF", linewidth = 1) +
+    ggplot2::geom_text(data = nodes, ggplot2::aes(x = x, y = y + 0.20, label = name),
+                       colour = "#FFFFFF", fontface = "bold", size = 3.7) +
+    ggplot2::geom_text(data = nodes,
+                       ggplot2::aes(x = x, y = y - 0.22,
+                                    label = paste0(format(rows, big.mark = ","), " rows  \u00b7  key: ", key)),
+                       colour = "#FFFFFF", size = 2.7) +
+    ggplot2::scale_fill_manual(values = fill_for, guide = "none") +
+    ggplot2::coord_equal(clip = "off") +
+    ggplot2::labs(title = "Dataset relationships",
+                  subtitle = paste0("Spine: ", spine, "  \u00b7  ", nc, " child table",
+                                    if (nc != 1) "s" else "",
+                                    if (ni > 0) paste0("  \u00b7  ", ni, " unlinked") else "")) +
+    ggplot2::theme_void(base_size = 14) +
+    ggplot2::theme(
+      plot.background = ggplot2::element_rect(fill = "#FFFFFF", colour = NA),
+      plot.title      = ggplot2::element_text(colour = "#1A2A3A", face = "bold", size = 15),
+      plot.subtitle   = ggplot2::element_text(colour = "#4A6070", size = 11),
+      plot.margin     = ggplot2::margin(20, 45, 20, 45))
+}
+
+# Histogram of rows-per-subject for one child table.
+plot_cardinality <- function(v, child_name, link_col) {
+  if (length(v) == 0) return(NULL)
+  med <- stats::median(v); mx <- max(v)
+  ggplot2::ggplot(data.frame(rows_per_subject = v), ggplot2::aes(x = rows_per_subject)) +
+    ggplot2::geom_histogram(binwidth = 1, fill = "#007A6E", colour = "#FFFFFF", alpha = 0.85) +
+    ggplot2::geom_vline(xintercept = med, colour = "#1A2A3A", linetype = "dashed", linewidth = 0.8) +
+    ggplot2::scale_x_continuous(breaks = scales::breaks_pretty()) +
+    ggplot2::labs(x = paste0("Rows per subject in ", child_name), y = "Number of subjects",
+                  title = paste0("Cardinality: ", child_name),
+                  subtitle = paste0("Linked on ", link_col, "  \u00b7  ", length(v),
+                                    " subjects with \u22651 row  \u00b7  median ", round(med, 1),
+                                    ", max ", mx)) +
+    .dre_theme_grid()
+}
+
+# ── LINKAGE REPORT EXPORT ─────────────────────────────────────────────────────
+build_linkage_csv <- function(tables, cls, child_rep, drift, file_path) {
+  con <- file(file_path, open = "w"); on.exit(close(con))
+  writeLines("## Linkage integrity report", con)
+  writeLines(paste0("# Generated: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S")), con)
+  writeLines(paste0("# Spine table: ", cls$spine, "  (link column: ", cls$info[[cls$spine]]$col, ")"), con)
+  writeLines(paste0("# Spine key unique & complete: ", if (cls$spine_is_clean) "yes" else "NO"), con)
+  writeLines("", con)
+  writeLines("## Per-table link column", con)
+  ktab <- do.call(rbind, lapply(cls$holders, function(h) data.frame(
+    table = h, link_column = cls$info[[h]]$col, type = cls$info[[h]]$type,
+    n_rows = cls$info[[h]]$n, n_distinct_ids = cls$info[[h]]$n_unique,
+    n_missing = cls$info[[h]]$n_na, unique_complete = cls$info[[h]]$is_unique,
+    role = if (h == cls$spine) "spine" else "child", stringsAsFactors = FALSE)))
+  utils::write.csv(ktab, con, row.names = FALSE)
+  writeLines("", con)
+  if (!is.null(child_rep)) {
+    writeLines("## Child tables: referential integrity, coverage & cardinality", con)
+    utils::write.csv(child_rep, con, row.names = FALSE)
+    writeLines("", con)
+  }
+  if (!is.null(drift)) {
+    writeLines("## Key format across tables", con)
+    utils::write.csv(drift, con, row.names = FALSE)
+  }
+}
 # ── 5. INLINE CSS ─────────────────────────────────────────────────────────────
 
 APP_CSS <- "
@@ -1006,6 +1359,20 @@ ui <- dashboardPage(
                    class = "btn-open-file"),
       uiOutput("selected_file_b_ui"),
       uiOutput("clear_b_btn_ui"),
+
+      # ── Relational dataset (multi-table) ──────────────────────────────────
+      tags$hr(class = "sidebar-divider"),
+      div(class = "sidebar-section-label", "Relational dataset (multi-table)"),
+      p(style = "font-size:0.82rem; color:#7A9AB0; margin-bottom:8px; line-height:1.45;",
+        "Load a whole folder of linked CSVs to map how they join and check linkage",
+        tags$strong(style = "color:#4DD9CA;", " integrity"), ". See the ",
+        tags$strong(style = "color:#4DD9CA;", "Relationships"), " and ",
+        tags$strong(style = "color:#4DD9CA;", "Linkage"), " tabs."),
+      actionButton("open_folder", label = tagList(icon("folder-tree"), " Load Folder of CSVs"),
+                   class = "btn-open-file"),
+      uiOutput("tables_status_ui"),
+      uiOutput("active_table_ui"),
+      uiOutput("clear_tables_ui"),
 
       div(class = "sidebar-root-note", "Root: ", tags$span(WORKSPACE_FILES))
     )
@@ -1359,6 +1726,8 @@ server <- function(input, output, session) {
       tabPanel("Group Analysis", value = "group",     br(), uiOutput("group_ui")),
       tabPanel("Timeline",       value = "timeline",  br(), uiOutput("timeline_ui")),
       tabPanel("Compare",        value = "compare",   br(), uiOutput("compare_ui")),
+      tabPanel("Relationships", value = "relationships", br(), uiOutput("relationships_ui")),
+      tabPanel("Linkage",       value = "linkage",       br(), uiOutput("linkage_ui")),
       tabPanel("Validation",     value = "validate",  br(), uiOutput("validate_ui")),
       tabPanel("Data Preview",   value = "preview",   br(), DTOutput("data_preview")),
       tabPanel("Help", value = "help",
@@ -1409,6 +1778,21 @@ server <- function(input, output, session) {
             tags$dd("Load a second CSV (Dataset B) via the sidebar to overlay distributions, compare
                      category proportions, and view a side-by-side statistics table for all matched columns.
                      Use this to check harmonisation between sites, or to compare pipeline versions."),
+            tags$dt("Relationships"),
+            tags$dd("Load a whole folder of linked CSVs (",
+                     tags$strong("Load Folder of CSVs"), " in the sidebar). The app detects the
+                     common identifier shared across files, identifies the subject ", tags$em("spine"),
+                     " (the table where that ID is a unique, complete key) and the child tables that
+                     reference it, and draws an entity-relationship diagram. Use the ",
+                     tags$strong("Active table"), " selector to profile any one of the loaded tables
+                     in all the single-file tabs above."),
+            tags$dt("Linkage"),
+            tags$dd("Integrity checks across the loaded tables, framed as what a relational load would
+                     reject: key uniqueness and completeness on the spine, orphaned child rows
+                     (referential integrity), subject coverage (structural missingness \u2014 subjects
+                     absent from a child table, not merely null), cardinality (rows per subject), and
+                     key format drift (type or formatting differences that would break a join). Export
+                     the findings with ", tags$strong("Save Linkage Report (CSV)"), "."),
             tags$dt("Validation"),
             tags$dd("Define expected value ranges per column as comma-separated rules (column,min,max).
                      The app flags violations with count, percentage, and sample values.
@@ -1421,8 +1805,10 @@ server <- function(input, output, session) {
             tags$li("Source datasets are read-only \u2014 loading and profiling never alters them."),
             tags$li("Saved plots and summaries are written into the workspace folder you choose
                      (default ", tags$code("/home/workspace/files/"), "), where the file manager
-                     and airlock can see them.")),
-          hr(), p(tags$em("Aridhia Cohort Profiler v4.1  \u00b7  aridhia.com"))
+                     and airlock can see them."),
+            tags$li("Loading a folder reads every CSV in it; files that fail to parse are skipped
+                     with a notification, and the largest table is made active automatically.")),
+          hr(), p(tags$em("Aridhia Cohort Profiler v4.2  \u00b7  aridhia.com"))
         ))
       )
     )))
@@ -1892,6 +2278,430 @@ server <- function(input, output, session) {
               colnames = names(tbl)) %>%
       formatStyle(columns = seq_along(tbl), backgroundColor = "#FFFFFF", color = "#1A2A3A") %>%
       formatStyle("Type", fontWeight = "bold")
+  })
+
+  # ══ RELATIONAL (MULTI-TABLE) - PHASE 1 ══════════════════════════════════════
+  tables_rv     <- reactiveVal(NULL)              # named list of data frames
+  tables_dir_rv <- reactiveVal(NULL)              # folder the tables came from
+  folder_dir    <- reactiveVal(WORKSPACE_FILES)   # current dir in the folder picker
+  active_tbl_rv <- reactiveVal(NULL)              # name of the active (single-file) table
+
+  observeEvent(input$open_folder,   { folder_dir(WORKSPACE_FILES); open_folder_modal(WORKSPACE_FILES) })
+  observeEvent(input$folder_nav_to, { folder_dir(input$folder_nav_to); open_folder_modal(input$folder_nav_to) })
+
+  # Copy a chosen table from the relational set into the single-file engine, so
+  # every existing tab (Overview, Distributions, ...) profiles it unchanged.
+  set_active_table <- function(nm) {
+    res <- tables_rv(); if (is.null(res) || is.null(res[[nm]])) return()
+    loaded(res[[nm]]); load_error(NULL)
+    p <- file.path(tables_dir_rv() %||% WORKSPACE_FILES, paste0(nm, ".csv"))
+    loaded_path(p); selected_file(p); active_tbl_rv(nm)
+  }
+
+  observeEvent(input$load_folder_confirm, {
+    dir <- folder_dir(); removeModal()
+    files <- list.files(dir, pattern = FILE_PATTERN, ignore.case = TRUE, full.names = TRUE)
+    if (length(files) == 0) {
+      showNotification("No CSV files in that folder.", type = "warning", duration = 5); return()
+    }
+    res <- list(); failed <- character(0)
+    withProgress(message = "Loading tables...", value = 0, {
+      for (i in seq_along(files)) {
+        nm <- tools::file_path_sans_ext(basename(files[i]))
+        df <- tryCatch(readr::read_csv(files[i], show_col_types = FALSE), error = function(e) NULL)
+        if (is.null(df)) failed <- c(failed, basename(files[i])) else res[[nm]] <- df
+        incProgress(1 / length(files), detail = basename(files[i]))
+      }
+    })
+    if (length(res) == 0) {
+      showNotification("None of the CSV files could be read.", type = "error", duration = 6); return()
+    }
+    tables_rv(res); tables_dir_rv(dir)
+    if (length(failed) > 0)
+      showNotification(paste0("Loaded ", length(res), " of ", length(files),
+                              " files. Skipped: ", paste(failed, collapse = ", ")),
+                       type = "warning", duration = 8)
+    else
+      showNotification(paste0("Loaded ", length(res), " table",
+                              if (length(res) != 1) "s" else "", "."),
+                       type = "message", duration = 4)
+    # Make the largest table active so the single-file tabs populate immediately.
+    active <- names(res)[which.max(vapply(res, nrow, integer(1)))]
+    set_active_table(active)
+    updateSelectInput(session, "active_table", choices = names(res), selected = active)
+  })
+
+  observeEvent(input$active_table, {
+    req(input$active_table); set_active_table(input$active_table)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$clear_tables, { tables_rv(NULL); tables_dir_rv(NULL); active_tbl_rv(NULL) })
+
+  output$tables_status_ui <- renderUI({
+    res <- tables_rv()
+    if (is.null(res))
+      return(div(class = "label-badge-none", style = "margin-top:8px;", "No folder loaded"))
+    tot <- sum(vapply(res, nrow, integer(1)))
+    div(class = "fb-selected-badge",
+        div(class = "fb-selected-label", "RELATIONAL SET"),
+        div(class = "fb-selected-name", paste0(length(res), " tables")),
+        div(class = "fb-selected-meta", format(tot, big.mark = ","), " rows total \u00b7 ",
+            basename(tables_dir_rv() %||% "")))
+  })
+
+  output$active_table_ui <- renderUI({
+    res <- tables_rv(); req(res)
+    tags$div(style = "margin-top:8px;",
+      div(class = "sidebar-section-label", style = "margin-top:4px;", "Active table (single-file tabs)"),
+      selectInput("active_table", label = NULL, choices = names(res),
+                  selected = active_tbl_rv() %||% names(res)[1]))
+  })
+
+  output$clear_tables_ui <- renderUI({
+    req(tables_rv())
+    tags$div(style = "margin-top:6px;",
+      actionButton("clear_tables", label = tagList(icon("xmark"), " Clear Relational Set"),
+                   class = "btn-open-file",
+                   style = "font-size:0.82rem !important; padding:6px 10px !important;"))
+  })
+
+  # ── Shared-column / link detection reactives ───────────────────────────────
+  shared_cols <- reactive({ res <- tables_rv(); req(res); detect_shared_columns(res) })
+
+  link_norm <- reactive({
+    sel <- input$link_col_sel
+    if (!is.null(sel) && nzchar(sel)) return(sel)
+    sc <- shared_cols(); if (is.null(sc) || nrow(sc) == 0) return(NULL)
+    sc$norm_name[1]
+  })
+
+  classification <- reactive({
+    res <- tables_rv(); req(res); ln <- link_norm(); req(ln); classify_link(res, ln)
+  })
+
+  child_report <- reactive({
+    res <- tables_rv(); cls <- classification(); req(res, cls)
+    if (length(cls$children) == 0) return(NULL)
+    linkage_child_report(res, cls)
+  })
+
+  drift_report <- reactive({
+    res <- tables_rv(); cls <- classification(); req(res, cls); linkage_format_drift(res, cls)
+  })
+
+  # ── Relationships tab ──────────────────────────────────────────────────────
+  output$relationships_ui <- renderUI({
+    res <- tables_rv()
+    if (is.null(res))
+      return(div(class = "empty-state",
+        div(class = "empty-icon", "\U0001f5c2\ufe0f"),
+        h4("No relational dataset loaded"),
+        p(style = "color:#4A6070; max-width:460px; margin:0 auto;",
+          "Use ", strong("Load Folder of CSVs"), " in the sidebar to load a set of linked tables.
+           The app detects the common identifier, works out how the files join, and draws the
+           relationships.")))
+    if (length(res) < 2)
+      return(div(class = "empty-state",
+        div(class = "empty-icon", "\U0001f4c4"), h4("Only one table loaded"),
+        p(style = "color:#4A6070;",
+          "Relationship mapping needs at least two CSV files in the folder.")))
+    sc <- shared_cols()
+    if (is.null(sc) || nrow(sc) == 0)
+      return(div(class = "alert-missing",
+        div(class = "alert-missing-title", "\u26a0  No shared columns found"),
+        p(style = "margin:0;",
+          "None of the loaded tables share a column name, so they cannot be linked through a
+           common identifier. Check that the ID column is named consistently across files.")))
+
+    link_choices <- stats::setNames(sc$norm_name,
+      sprintf("%s  (in %d tables: %s)", sc$column, sc$n_tables, sc$tables))
+    tagList(
+      div(class = "section-tag", "Common identifier"),
+      fluidRow(
+        column(6,
+          div(class = "control-panel",
+              div(class = "control-label", "Link tables on"),
+              selectInput("link_col_sel", label = NULL, choices = link_choices, selected = link_norm()),
+              p(style = "font-size:0.82rem; color:#4A6070; margin:6px 0 0;",
+                "Detected automatically. Change it if a different column is the shared subject ID."))),
+        column(6, uiOutput("spine_note_ui"))
+      ),
+      tags$hr(style = "margin:18px 0; border-color:#CDD5DF;"),
+      div(class = "section-tag", "Detected keys & link column per table"),
+      DTOutput("keys_tbl"),
+      tags$hr(style = "margin:18px 0; border-color:#CDD5DF;"),
+      plot_dl_btn("dl_er"),
+      plotOutput("er_plot", height = "480px")
+    )
+  })
+
+  output$spine_note_ui <- renderUI({
+    cls <- classification(); req(cls)
+    clean <- cls$spine_is_clean
+    div(class = if (clean) "alert-info" else "alert-missing",
+        div(class = if (clean) "alert-info-title" else "alert-missing-title",
+            if (clean) "\U0001f511  Subject spine" else "\u26a0  No clean spine"),
+        if (clean)
+          p(style = "font-size:0.9rem; margin:0;",
+            tags$strong(cls$spine), " holds the identifier as a unique, complete key \u2014 it is the
+             subject spine. ", tags$strong(length(cls$children)), " child table",
+            if (length(cls$children) != 1) "s" else "", " reference it.")
+        else
+          p(style = "font-size:0.9rem; margin:0;",
+            "No table holds the identifier as a unique, complete key, so there is no clean subject
+             spine. ", tags$strong(cls$spine), " was used as the reference (most distinct IDs).
+             Duplicate or missing IDs there will distort the checks \u2014 see the Linkage tab."))
+  })
+
+  output$keys_tbl <- renderDT({
+    res <- tables_rv(); req(res); ln <- link_norm()
+    rows <- do.call(rbind, lapply(names(res), function(tn) {
+      df <- res[[tn]]; pk <- best_primary_key(df)
+      lc <- if (!is.null(ln)) resolve_col(df, ln) else NA_character_
+      has_link <- !is.na(lc)
+      uniq_here <- if (has_link) { x <- df[[lc]]
+        (sum(is.na(x)) == 0 && length(unique(x)) == nrow(df) && nrow(df) > 0) } else NA
+      data.frame(
+        Table = tn, Rows = format(nrow(df), big.mark = ","), Columns = ncol(df),
+        Primary_key = pk %||% "(none unique)",
+        Has_link_col = if (has_link) "yes" else "no",
+        Link_is_unique = if (!has_link) "\u2014" else if (isTRUE(uniq_here)) "yes (spine)" else "no (child)",
+        stringsAsFactors = FALSE)
+    }))
+    datatable(rows, rownames = FALSE, options = list(pageLength = 15, scrollX = TRUE, dom = "tp")) %>%
+      formatStyle(columns = seq_along(rows), backgroundColor = "#FFFFFF", color = "#1A2A3A") %>%
+      formatStyle("Primary_key", fontWeight = "bold")
+  })
+
+  output$er_plot <- renderPlot({
+    res <- tables_rv(); cls <- classification(); req(res, cls)
+    plot_er_diagram(res, cls, child_report())
+  }, bg = "#FFFFFF")
+
+  observeEvent(input$dl_er, {
+    res <- tables_rv(); cls <- classification(); req(res, cls)
+    p <- plot_er_diagram(res, cls, child_report())
+    start_save(paste0("relationships_", format(Sys.Date(), "%Y%m%d"), ".png"),
+               function(f) save_plot_png(p, f, width = 11, height = 7))
+  })
+
+  # ── Linkage tab ────────────────────────────────────────────────────────────
+  output$linkage_ui <- renderUI({
+    res <- tables_rv()
+    if (is.null(res))
+      return(div(class = "empty-state",
+        div(class = "empty-icon", "\U0001f517"), h4("No relational dataset loaded"),
+        p(style = "color:#4A6070; max-width:460px; margin:0 auto;",
+          "Load a folder of linked CSVs in the sidebar to run linkage-integrity checks: key
+           uniqueness, orphaned rows, subject coverage, cardinality, and key format drift.")))
+    if (length(res) < 2)
+      return(div(class = "empty-state",
+        div(class = "empty-icon", "\U0001f4c4"), h4("Only one table loaded"),
+        p(style = "color:#4A6070;", "Linkage checks need at least two linked CSV files.")))
+    cls <- classification()
+    if (is.null(cls))
+      return(div(class = "alert-missing",
+        div(class = "alert-missing-title", "\u26a0  No common identifier"),
+        p(style = "margin:0;", "Pick a shared link column in the Relationships tab first.")))
+
+    cr <- child_report()
+    spine_col <- cls$info[[cls$spine]]$col
+    n_ref     <- cls$info[[cls$spine]]$n_unique
+    dup_spine <- cls$info[[cls$spine]]$n - cls$info[[cls$spine]]$n_unique - cls$info[[cls$spine]]$n_na
+    types     <- vapply(cls$holders, function(h) cls$info[[h]]$type, character(1))
+    type_drift    <- length(unique(types)) > 1
+    total_orphans <- if (!is.null(cr)) sum(cr$n_orphan) else 0
+    any_fail      <- (!cls$spine_is_clean) || total_orphans > 0 || type_drift
+
+    tagList(
+      div(class = if (any_fail) "alert-missing" else "alert-info",
+          div(class = if (any_fail) "alert-missing-title" else "alert-info-title",
+              if (any_fail) "\u26a0  Linkage issues detected" else "\u2714  Linkage looks clean"),
+          p(style = "margin:0; font-size:0.92rem;",
+            if (any_fail)
+              "One or more checks below would block a clean relational load. A database would reject
+               these; review them before linking the tables for analysis."
+            else
+              "The identifier is a clean key on the spine, every child row resolves to a subject, and
+               the key format is consistent across tables.")),
+
+      div(class = "section-tag", style = "margin-top:18px;", "Linkage summary"),
+      div(class = "stat-row",
+          div(class = "stat-card",
+              div(class = "stat-number", format(n_ref, big.mark = ",")),
+              div(class = "stat-label", paste0("Subjects (", cls$spine, ")"))),
+          div(class = "stat-card",
+              div(class = if (!cls$spine_is_clean) "stat-number-warn" else "stat-number",
+                  format(max(0, dup_spine), big.mark = ",")),
+              div(class = "stat-label", "Duplicate spine IDs")),
+          div(class = "stat-card",
+              div(class = if (total_orphans > 0) "stat-number-warn" else "stat-number",
+                  format(total_orphans, big.mark = ",")),
+              div(class = "stat-label", "Orphaned child rows")),
+          div(class = "stat-card",
+              div(class = "stat-number", length(cls$children)),
+              div(class = "stat-label", "Child tables"))),
+
+      div(class = "section-tag", style = "margin-top:8px;", "1 \u00b7 Key uniqueness & completeness"),
+      if (!cls$spine_is_clean)
+        div(class = "alert-outlier",
+            div(class = "alert-outlier-title", "\u25ca  A PRIMARY KEY constraint would fail"),
+            p(style = "margin:0; font-size:0.9rem;",
+              "On ", tags$strong(paste0(cls$spine, ".", spine_col)), ": ",
+              format(max(0, dup_spine), big.mark = ","), " duplicate and ",
+              format(cls$info[[cls$spine]]$n_na, big.mark = ","),
+              " missing identifier value(s). The spine cannot uniquely identify subjects until these
+               are resolved.")),
+      DTOutput("linkage_key_tbl"),
+
+      if (!is.null(cr)) tagList(
+        div(class = "section-tag", style = "margin-top:18px;", "2 \u00b7 Referential integrity (orphans)"),
+        if (total_orphans > 0)
+          div(class = "alert-outlier",
+              div(class = "alert-outlier-title", "\u25ca  A FOREIGN KEY constraint would reject rows"),
+              p(style = "margin:0; font-size:0.9rem;",
+                format(total_orphans, big.mark = ","), " child row(s) reference an identifier that does
+                 not exist on the spine. A database foreign key would refuse these inserts."))
+        else
+          div(class = "alert-info",
+              div(class = "alert-info-title", "\u2714  No orphaned rows"),
+              p(style = "margin:0; font-size:0.9rem;",
+                "Every child row resolves to a subject on the spine.")),
+        DTOutput("linkage_orphan_tbl")
+      ),
+
+      if (!is.null(cr)) tagList(
+        div(class = "section-tag", style = "margin-top:18px;",
+            "3 \u00b7 Subject coverage (structural missingness)"),
+        div(class = "alert-info",
+            div(class = "alert-info-title", "\U0001f4a1  Records that are absent, not null"),
+            p(style = "margin:0; font-size:0.9rem;",
+              "A subject with no rows in a child table has no value that can be \u201cmissing\u201d \u2014
+               this structural gap is invisible to single-file profiling. The percentages below show
+               how much of the cohort each child table actually covers.")),
+        DTOutput("linkage_coverage_tbl")
+      ),
+
+      if (!is.null(cr) && length(cls$children) > 0) tagList(
+        div(class = "section-tag", style = "margin-top:18px;", "4 \u00b7 Cardinality (rows per subject)"),
+        fluidRow(
+          column(4,
+            div(class = "control-panel",
+                div(class = "control-label", "Child table"),
+                selectInput("card_child", label = NULL, choices = cls$children, selected = cls$children[1])),
+            div(class = "alert-info",
+                div(class = "alert-info-title", style = "font-size:0.82rem;", "Why this matters"),
+                p(style = "font-size:0.86rem; color:#4A6070; margin:0;",
+                  "Joining the spine to a one-to-many child multiplies rows. Knowing the fan-out up
+                   front prevents inflated subject counts after a join."))),
+          column(8, plot_dl_btn("dl_card"), plotOutput("card_plot", height = "360px")))
+      ),
+
+      div(class = "section-tag", style = "margin-top:18px;", "5 \u00b7 Key format across tables"),
+      if (type_drift)
+        div(class = "alert-outlier",
+            div(class = "alert-outlier-title", "\u25ca  Join would require a CAST"),
+            p(style = "margin:0; font-size:0.9rem;",
+              "The identifier is stored as different types across tables (",
+              paste(unique(types), collapse = ", "),
+              "). A database could not join these without an explicit cast, and a naive merge in R may
+               match far fewer rows than expected."))
+      else
+        div(class = "alert-info",
+            div(class = "alert-info-title", "\u2714  Consistent key format"),
+            p(style = "margin:0; font-size:0.9rem;",
+              "The identifier has a consistent type across all tables that hold it.")),
+      DTOutput("linkage_drift_tbl"),
+
+      tags$hr(style = "margin:22px 0; border-color:#CDD5DF;"),
+      div(class = "alert-info",
+          div(class = "alert-info-title", "Next step \u00b7 enforce these relationships"),
+          p(style = "margin:0; font-size:0.92rem;",
+            "Everything flagged here is something the workspace database would enforce automatically.
+             Once the integrity issues are resolved, importing these tables into the database would keep
+             the keys unique, reject orphaned rows on insert, and hold the relationships as the data
+             grows \u2014 your workspace administrator can help set this up. For day-to-day exploration,
+             though, the flat files are fully profiled here.")),
+      tags$div(style = "margin-top:10px;",
+        actionButton("save_linkage", label = tagList(icon("floppy-disk"), " Save Linkage Report (CSV)"),
+                     class = "btn-export", style = "width:auto; display:inline-block;"))
+    )
+  })
+
+  output$linkage_key_tbl <- renderDT({
+    cls <- classification(); req(cls)
+    rows <- do.call(rbind, lapply(cls$holders, function(h) data.frame(
+      Table = h, Link_column = cls$info[[h]]$col, Type = cls$info[[h]]$type,
+      Rows = format(cls$info[[h]]$n, big.mark = ","),
+      Distinct_IDs = format(cls$info[[h]]$n_unique, big.mark = ","),
+      Missing_IDs = format(cls$info[[h]]$n_na, big.mark = ","),
+      Unique_and_complete = if (cls$info[[h]]$is_unique) "yes" else "no",
+      Role = if (h == cls$spine) "spine" else "child", stringsAsFactors = FALSE)))
+    datatable(rows, rownames = FALSE, options = list(pageLength = 15, scrollX = TRUE, dom = "tp")) %>%
+      formatStyle(columns = seq_along(rows), backgroundColor = "#FFFFFF", color = "#1A2A3A") %>%
+      formatStyle("Unique_and_complete",
+                  color = styleEqual(c("yes", "no"), c("#007A6E", "#B04000")), fontWeight = "bold") %>%
+      formatStyle("Role", fontWeight = "bold")
+  })
+
+  output$linkage_orphan_tbl <- renderDT({
+    res <- tables_rv(); cls <- classification(); cr <- child_report(); req(res, cls, cr)
+    rows <- do.call(rbind, lapply(seq_len(nrow(cr)), function(i) {
+      ch <- cr$child[i]
+      data.frame(
+        Child_table = ch, Link_column = cr$link_col[i],
+        Rows = format(cr$n_rows[i], big.mark = ","),
+        Missing_key = format(cr$n_missing_key[i], big.mark = ","),
+        Orphan_rows = format(cr$n_orphan[i], big.mark = ","),
+        Pct_orphan = paste0(cr$pct_orphan[i], "%"),
+        Sample_orphan_ids = orphan_sample(res, cls, ch), stringsAsFactors = FALSE)
+    }))
+    datatable(rows, rownames = FALSE, options = list(pageLength = 15, scrollX = TRUE, dom = "tp")) %>%
+      formatStyle(columns = seq_along(rows), backgroundColor = "#FFFFFF", color = "#1A2A3A") %>%
+      formatStyle("Orphan_rows", fontWeight = "bold")
+  })
+
+  output$linkage_coverage_tbl <- renderDT({
+    cr <- child_report(); req(cr)
+    rows <- data.frame(
+      Child_table = cr$child, Subjects_covered = format(cr$subjects_covered, big.mark = ","),
+      Pct_of_cohort = paste0(cr$pct_coverage, "%"),
+      Subjects_with_no_rows = format(cr$n_childless, big.mark = ","), stringsAsFactors = FALSE)
+    datatable(rows, rownames = FALSE, options = list(pageLength = 15, scrollX = TRUE, dom = "tp")) %>%
+      formatStyle(columns = seq_along(rows), backgroundColor = "#FFFFFF", color = "#1A2A3A") %>%
+      formatStyle("Pct_of_cohort", fontWeight = "bold")
+  })
+
+  output$card_plot <- renderPlot({
+    res <- tables_rv(); cls <- classification(); req(res, cls)
+    ch <- input$card_child %||% (if (length(cls$children) > 0) cls$children[1] else NULL); req(ch)
+    v <- cardinality_vector(res, cls, ch); req(length(v) > 0)
+    plot_cardinality(v, ch, cls$info[[cls$spine]]$col)
+  }, bg = "#FFFFFF")
+
+  observeEvent(input$dl_card, {
+    res <- tables_rv(); cls <- classification(); req(res, cls)
+    ch <- input$card_child %||% cls$children[1]; req(ch)
+    v <- cardinality_vector(res, cls, ch); req(length(v) > 0)
+    p <- plot_cardinality(v, ch, cls$info[[cls$spine]]$col)
+    start_save(paste0("cardinality_", ch, "_", format(Sys.Date(), "%Y%m%d"), ".png"),
+               function(f) save_plot_png(p, f, width = 11, height = 6))
+  })
+
+  output$linkage_drift_tbl <- renderDT({
+    drift <- drift_report(); req(drift)
+    colnames(drift) <- c("Table", "Link_column", "R_type", "ID_width",
+                         "Whitespace", "Leading_zeros", "Sample_values")
+    datatable(drift, rownames = FALSE, options = list(pageLength = 15, scrollX = TRUE, dom = "tp")) %>%
+      formatStyle(columns = seq_along(drift), backgroundColor = "#FFFFFF", color = "#1A2A3A") %>%
+      formatStyle("R_type", fontWeight = "bold")
+  })
+
+  observeEvent(input$save_linkage, {
+    res <- tables_rv(); cls <- classification(); req(res, cls)
+    cr <- child_report(); drift <- drift_report()
+    start_save(paste0("linkage_report_", format(Sys.Date(), "%Y%m%d"), ".csv"),
+               function(f) build_linkage_csv(res, cls, cr, drift, f))
   })
 
   # ── Validation tab ──────────────────────────────────────────────────────────
